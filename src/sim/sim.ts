@@ -408,6 +408,19 @@ export interface PetState {
   mode?: PetMode;
 }
 
+// Immutable entry in the economy audit trail. Append-only; never modified
+// after creation. Used for forensic analysis and rollback investigation.
+export interface EconomyAuditEntry {
+  simTime: number;
+  pid: number;
+  type: 'copper' | 'item_add' | 'item_remove' | 'trade' | 'market_buy' | 'market_list' | 'market_cancel' | 'market_collect' | 'vendor_buy' | 'vendor_sell' | 'item_discard';
+  itemId?: string;
+  count?: number;
+  copperBefore: number;
+  copperAfter: number;
+  detail: string;
+}
+
 const PET_NAME_RE = /^[A-Za-z][A-Za-z '-]{1,15}$/;
 
 interface PendingMobRespawn {
@@ -526,6 +539,28 @@ export class Sim {
   /** When true, /dev level|tp|give chat commands are accepted (local dev only). */
   readonly devCommands: boolean;
   private pendingMobRespawns: PendingMobRespawn[] = [];
+
+  // ── Economy Security ──────────────────────────────────────────────
+  // Per-player economy mutex: prevents concurrent economy operations
+  // (trade, market, vendor, etc.) on the same player from racing.
+  // Set to true while an economy operation is in-flight for that pid.
+  private economyLocks = new Set<number>();
+
+  // Economic audit trail — every copper/item movement is logged here.
+  // Append-only: rows are never modified after insertion.
+  // Schema: { pid, timestamp, type, itemId?, count?, copperBefore, copperAfter, detail }
+  readonly economyAuditLog: EconomyAuditEntry[] = [];
+
+  // Per-player action cooldown tracker, keyed by category string.
+  // Prevents rapid-fire command spam that could race or DOS.
+  // `at` is sim.time; `interval` is the minimum seconds between actions.
+  private actionCooldowns = new Map<string, number>();
+
+  // Movement anomaly detection: track distance-per-tick for speed-hack
+  // detection. Reset on teleport/zone-change.
+  private speedViolations = new Map<number, { count: number; warned: boolean; lastPos: Vec3 | null }>();
+
+  // ── Economy Security ──────────────────────────────────────────────
 
   constructor(cfg: SimConfig) {
     this.devCommands = cfg.devCommands ?? false;
@@ -774,6 +809,10 @@ export class Sim {
     this.players.delete(pid);
     this.chatTokens.delete(pid);
     this.channelSubs.delete(pid);
+    // Clean up economy security state
+    this.economyLocks.delete(pid);
+    this.speedViolations.delete(pid);
+    this.clearActionRates(pid);
     if (this.primaryId === pid) this.primaryId = this.players.size > 0 ? [...this.players.keys()][0] : -1;
   }
 
@@ -824,6 +863,62 @@ export class Sim {
   changeSkin(skin: number): void {
     this.setPlayerSkin(this.primaryId, skin);
   }
+
+  // ── Economy Security Utilities ──────────────────────────────────────
+
+  // Try to acquire an economy lock for the given player. Returns true if
+  // the lock was acquired, false if it was already held (concurrent operation).
+  // The caller MUST call releaseEconomyLock in a finally/else block.
+  private tryEconomyLock(pid: number): boolean {
+    if (this.economyLocks.has(pid)) return false;
+    this.economyLocks.add(pid);
+    return true;
+  }
+
+  private releaseEconomyLock(pid: number): void {
+    this.economyLocks.delete(pid);
+  }
+
+  // Append an immutable audit entry for every copper or item movement.
+  private auditEconomy(
+    pid: number,
+    type: EconomyAuditEntry['type'],
+    copperBefore: number,
+    copperAfter: number,
+    detail: string,
+    itemId?: string,
+    count?: number,
+  ): void {
+    this.economyAuditLog.push({
+      simTime: this.time,
+      pid,
+      type,
+      itemId,
+      count,
+      copperBefore,
+      copperAfter,
+      detail,
+    });
+  }
+
+  // Per-player action rate limiting: prevents >1 action in the given
+  // category within `interval` seconds. Returns true if allowed.
+  private checkActionRate(pid: number, category: string, interval: number): boolean {
+    const key = `${pid}:${category}`;
+    const last = this.actionCooldowns.get(key) ?? -Infinity;
+    if (this.time - last < interval) return false;
+    this.actionCooldowns.set(key, this.time);
+    return true;
+  }
+
+  // Clear all action cooldowns for a player (on disconnect/reset).
+  private clearActionRates(pid: number): void {
+    for (const key of this.actionCooldowns.keys()) {
+      if (key.startsWith(`${pid}:`)) this.actionCooldowns.delete(key);
+    }
+  }
+
+  // ── Economy Security Utilities ──────────────────────────────────────
 
   // -------------------------------------------------------------------------
   // Back-compat accessors: single-player contexts (offline game, RL env, tests)
@@ -4704,19 +4799,31 @@ export class Sim {
     const r = this.resolve(pid);
     if (!r) return;
     const { meta, e: p } = r;
-    const npc = this.entities.get(npcId);
-    const def = ITEMS[itemId];
-    if (!npc || npc.kind !== 'npc' || npc.vendorItems.length === 0) {
-      this.error(meta.entityId, 'That merchant is not available.');
+    if (!this.checkActionRate(r.meta.entityId, 'vendor_buy', 0.2)) return;
+    if (!this.tryEconomyLock(r.meta.entityId)) {
+      this.error(r.meta.entityId, 'Please wait, another transaction is processing.');
       return;
     }
-    if (!npc.vendorItems.includes(itemId)) { this.error(meta.entityId, 'That item is not sold here.'); return; }
-    if (!def?.buyValue) { this.error(meta.entityId, 'That item is not for sale.'); return; }
-    if (dist2d(p.pos, npc.pos) > INTERACT_RANGE + 2) { this.error(meta.entityId, 'Too far away.'); return; }
-    if (meta.copper < def.buyValue) { this.error(meta.entityId, 'Not enough money.'); return; }
-    meta.copper -= def.buyValue;
-    this.addItem(itemId, 1, meta.entityId);
-    this.emit({ type: 'vendor', action: 'buy', itemId, pid: meta.entityId });
+    try {
+      const npc = this.entities.get(npcId);
+      const def = ITEMS[itemId];
+      if (!npc || npc.kind !== 'npc' || npc.vendorItems.length === 0) {
+        this.error(meta.entityId, 'That merchant is not available.');
+        return;
+      }
+      if (!npc.vendorItems.includes(itemId)) { this.error(meta.entityId, 'That item is not sold here.'); return; }
+      if (!def?.buyValue) { this.error(meta.entityId, 'That item is not for sale.'); return; }
+      if (dist2d(p.pos, npc.pos) > INTERACT_RANGE + 2) { this.error(meta.entityId, 'Too far away.'); return; }
+      if (meta.copper < def.buyValue) { this.error(meta.entityId, 'Not enough money.'); return; }
+      const copperBefore = meta.copper;
+      meta.copper -= def.buyValue;
+      this.addItem(itemId, 1, meta.entityId);
+      this.auditEconomy(meta.entityId, 'vendor_buy', copperBefore, meta.copper,
+        `Bought ${def.name} for ${def.buyValue}c`, itemId, 1);
+      this.emit({ type: 'vendor', action: 'buy', itemId, pid: meta.entityId });
+    } finally {
+      this.releaseEconomyLock(r.meta.entityId);
+    }
   }
 
   private vendorInRange(p: Entity): boolean {
@@ -4740,39 +4847,63 @@ export class Sim {
     const r = this.resolve(pid);
     if (!r) return;
     const { meta, e: p } = r;
-    const def = ITEMS[itemId];
-    const available = this.countItem(itemId, meta.entityId);
-    if (!def || available <= 0) { this.error(meta.entityId, "You don't have that item."); return; }
-    if (p.dead) { this.error(meta.entityId, "You can't do that while dead."); return; }
-    const sellCount = Number.isFinite(count) ? Math.min(Math.floor(count), available) : 0;
-    if (sellCount <= 0) return;
-    if (!this.vendorInRange(p)) { this.error(meta.entityId, 'There is no merchant nearby.'); return; }
-    if (def.kind === 'quest') { this.error(meta.entityId, 'You cannot sell quest items.'); return; }
-    this.removeItem(itemId, sellCount, meta.entityId);
-    this.recordVendorBuyback(meta, itemId, sellCount);
-    const payout = def.sellValue * sellCount;
-    meta.copper += payout;
-    this.emit({ type: 'vendor', action: 'sell', itemId, pid: meta.entityId });
-    this.emit({ type: 'loot', text: `Sold ${def.name}${sellCount > 1 ? ' x' + sellCount : ''} for ${formatMoney(payout)}.`, pid: meta.entityId });
+    if (!this.checkActionRate(r.meta.entityId, 'vendor_sell', 0.2)) return;
+    if (!this.tryEconomyLock(r.meta.entityId)) {
+      this.error(r.meta.entityId, 'Please wait, another transaction is processing.');
+      return;
+    }
+    try {
+      const def = ITEMS[itemId];
+      const available = this.countItem(itemId, meta.entityId);
+      if (!def || available <= 0) { this.error(meta.entityId, "You don't have that item."); return; }
+      if (p.dead) { this.error(meta.entityId, "You can't do that while dead."); return; }
+      const sellCount = Number.isFinite(count) ? Math.min(Math.floor(count), available) : 0;
+      if (sellCount <= 0) return;
+      if (!this.vendorInRange(p)) { this.error(meta.entityId, 'There is no merchant nearby.'); return; }
+      if (def.kind === 'quest') { this.error(meta.entityId, 'You cannot sell quest items.'); return; }
+      const copperBefore = meta.copper;
+      this.removeItem(itemId, sellCount, meta.entityId);
+      this.recordVendorBuyback(meta, itemId, sellCount);
+      const payout = def.sellValue * sellCount;
+      meta.copper += payout;
+      this.auditEconomy(meta.entityId, 'vendor_sell', copperBefore, meta.copper,
+        `Sold ${def.name} x${sellCount} for ${payout}c`, itemId, sellCount);
+      this.emit({ type: 'vendor', action: 'sell', itemId, pid: meta.entityId });
+      this.emit({ type: 'loot', text: `Sold ${def.name}${sellCount > 1 ? ' x' + sellCount : ''} for ${formatMoney(payout)}.`, pid: meta.entityId });
+    } finally {
+      this.releaseEconomyLock(r.meta.entityId);
+    }
   }
 
   buyBackItem(itemId: string, pid?: number): void {
     const r = this.resolve(pid);
     if (!r) return;
     const { meta, e: p } = r;
-    const def = ITEMS[itemId];
-    const slot = meta.vendorBuyback.find((s) => s.itemId === itemId);
-    if (!def || !slot || slot.count <= 0) { this.error(meta.entityId, 'That item is not available for buyback.'); return; }
-    if (p.dead) { this.error(meta.entityId, "You can't do that while dead."); return; }
-    if (!this.vendorInRange(p)) { this.error(meta.entityId, 'There is no merchant nearby.'); return; }
-    if (meta.copper < def.sellValue) { this.error(meta.entityId, 'Not enough money.'); return; }
-    meta.copper -= def.sellValue;
-    slot.count -= 1;
-    if (slot.count <= 0) meta.vendorBuyback = meta.vendorBuyback.filter((s) => s !== slot);
-    this.addItemSilent(itemId, 1, meta);
-    this.onInventoryChangedForQuests(meta);
-    this.emit({ type: 'vendor', action: 'buyback', itemId, pid: meta.entityId });
-    this.emit({ type: 'loot', text: `Bought back ${def.name} for ${formatMoney(def.sellValue)}.`, pid: meta.entityId });
+    if (!this.checkActionRate(r.meta.entityId, 'vendor_buyback', 0.3)) return;
+    if (!this.tryEconomyLock(r.meta.entityId)) {
+      this.error(r.meta.entityId, 'Please wait, another transaction is processing.');
+      return;
+    }
+    try {
+      const def = ITEMS[itemId];
+      const slot = meta.vendorBuyback.find((s) => s.itemId === itemId);
+      if (!def || !slot || slot.count <= 0) { this.error(meta.entityId, 'That item is not available for buyback.'); return; }
+      if (p.dead) { this.error(meta.entityId, "You can't do that while dead."); return; }
+      if (!this.vendorInRange(p)) { this.error(meta.entityId, 'There is no merchant nearby.'); return; }
+      if (meta.copper < def.sellValue) { this.error(meta.entityId, 'Not enough money.'); return; }
+      const copperBefore = meta.copper;
+      meta.copper -= def.sellValue;
+      slot.count -= 1;
+      if (slot.count <= 0) meta.vendorBuyback = meta.vendorBuyback.filter((s) => s !== slot);
+      this.addItemSilent(itemId, 1, meta);
+      this.onInventoryChangedForQuests(meta);
+      this.auditEconomy(meta.entityId, 'vendor_sell', copperBefore, meta.copper,
+        `Buyback ${def.name} for ${def.sellValue}c`, itemId, 1);
+      this.emit({ type: 'vendor', action: 'buyback', itemId, pid: meta.entityId });
+      this.emit({ type: 'loot', text: `Bought back ${def.name} for ${formatMoney(def.sellValue)}.`, pid: meta.entityId });
+    } finally {
+      this.releaseEconomyLock(r.meta.entityId);
+    }
   }
 
   private addItemSilent(itemId: string, count: number, meta: PlayerMeta): void {
@@ -6278,70 +6409,98 @@ export class Sim {
   tradeSetOffer(items: InvSlot[], copper: number, pid?: number): void {
     const r = this.resolve(pid);
     if (!r) return;
-    const session = this.trades.get(r.meta.entityId);
-    if (!session) return;
-    // validate the offer against the player's bags; merge duplicate slots so
-    // the offered total per item is checked, not each slot in isolation
-    const merged = new Map<string, number>();
-    for (const slot of items.slice(0, 6)) {
-      // slots come straight off the wire — reject anything malformed
-      if (!slot || typeof slot.itemId !== 'string' || !Number.isFinite(slot.count)) continue;
-      const count = Math.max(1, Math.floor(slot.count));
-      const def = ITEMS[slot.itemId];
-      if (!def || def.kind === 'quest') continue; // quest items are soulbound-ish
-      merged.set(slot.itemId, (merged.get(slot.itemId) ?? 0) + count);
+    // Acquire economy lock — prevents race with other economy operations
+    if (!this.tryEconomyLock(r.meta.entityId)) {
+      this.error(r.meta.entityId, 'Please wait, another transaction is processing.');
+      return;
     }
-    const cleaned: InvSlot[] = [];
-    for (const [itemId, count] of merged) {
-      if (this.countItem(itemId, r.meta.entityId) < count) continue;
-      cleaned.push({ itemId, count });
+    try {
+      const session = this.trades.get(r.meta.entityId);
+      if (!session) return;
+      // validate the offer against the player's bags; merge duplicate slots so
+      // the offered total per item is checked, not each slot in isolation
+      const merged = new Map<string, number>();
+      for (const slot of items.slice(0, 6)) {
+        // slots come straight off the wire — reject anything malformed
+        if (!slot || typeof slot.itemId !== 'string' || !Number.isFinite(slot.count)) continue;
+        const count = Math.max(1, Math.floor(slot.count));
+        const def = ITEMS[slot.itemId];
+        if (!def || def.kind === 'quest') continue; // quest items are soulbound-ish
+        merged.set(slot.itemId, (merged.get(slot.itemId) ?? 0) + count);
+      }
+      const cleaned: InvSlot[] = [];
+      for (const [itemId, count] of merged) {
+        if (this.countItem(itemId, r.meta.entityId) < count) continue;
+        cleaned.push({ itemId, count });
+      }
+      const offer = { items: cleaned, copper: Math.max(0, Math.min(Math.floor(copper), r.meta.copper)) };
+      if (session.a === r.meta.entityId) session.offerA = offer;
+      else session.offerB = offer;
+      session.acceptedA = false;
+      session.acceptedB = false;
+    } finally {
+      this.releaseEconomyLock(r.meta.entityId);
     }
-    const offer = { items: cleaned, copper: Math.max(0, Math.min(Math.floor(copper), r.meta.copper)) };
-    if (session.a === r.meta.entityId) session.offerA = offer;
-    else session.offerB = offer;
-    session.acceptedA = false;
-    session.acceptedB = false;
   }
 
   tradeConfirm(pid?: number): void {
     const r = this.resolve(pid);
     if (!r) return;
+    if (!this.checkActionRate(r.meta.entityId, 'trade_confirm', 0.5)) return; // max 2/s
+    // Acquire economy lock for BOTH traders to prevent race with other ops
     const session = this.trades.get(r.meta.entityId);
     if (!session) return;
-    if (session.a === r.meta.entityId) session.acceptedA = true;
-    else session.acceptedB = true;
-    if (!(session.acceptedA && session.acceptedB)) return;
-
-    const metaA = this.players.get(session.a);
-    const metaB = this.players.get(session.b);
-    if (!metaA || !metaB) { this.tradeCancel(session.a); return; }
-    // final validation before the atomic swap
-    const valid =
-      session.offerA.copper <= metaA.copper &&
-      session.offerB.copper <= metaB.copper &&
-      this.offerCovered(session.offerA.items, session.a) &&
-      this.offerCovered(session.offerB.items, session.b);
-    if (!valid) {
-      for (const tPid of [session.a, session.b]) this.error(tPid, 'Trade failed: items or money no longer available.');
-      this.closeTrade(session);
+    if (!this.tryEconomyLock(session.a) || !this.tryEconomyLock(session.b)) {
+      if (this.economyLocks.has(session.a)) this.releaseEconomyLock(session.a);
+      this.error(r.meta.entityId, 'Please wait, another transaction is processing.');
       return;
     }
-    // swap
-    metaA.copper = metaA.copper - session.offerA.copper + session.offerB.copper;
-    metaB.copper = metaB.copper - session.offerB.copper + session.offerA.copper;
-    for (const s of session.offerA.items) {
-      this.removeItem(s.itemId, s.count, session.a);
-      this.addItem(s.itemId, s.count, session.b);
+    try {
+      if (session.a === r.meta.entityId) session.acceptedA = true;
+      else session.acceptedB = true;
+      if (!(session.acceptedA && session.acceptedB)) return;
+
+      const metaA = this.players.get(session.a);
+      const metaB = this.players.get(session.b);
+      if (!metaA || !metaB) { this.tradeCancel(session.a); return; }
+      // final validation before the atomic swap
+      const valid =
+        session.offerA.copper <= metaA.copper &&
+        session.offerB.copper <= metaB.copper &&
+        this.offerCovered(session.offerA.items, session.a) &&
+        this.offerCovered(session.offerB.items, session.b);
+      if (!valid) {
+        for (const tPid of [session.a, session.b]) this.error(tPid, 'Trade failed: items or money no longer available.');
+        this.closeTrade(session);
+        return;
+      }
+      // Atomic swap — both sides within the same economy lock scope
+      const copperA_before = metaA.copper;
+      const copperB_before = metaB.copper;
+      metaA.copper = metaA.copper - session.offerA.copper + session.offerB.copper;
+      metaB.copper = metaB.copper - session.offerB.copper + session.offerA.copper;
+      for (const s of session.offerA.items) {
+        this.removeItem(s.itemId, s.count, session.a);
+        this.addItem(s.itemId, s.count, session.b);
+      }
+      for (const s of session.offerB.items) {
+        this.removeItem(s.itemId, s.count, session.b);
+        this.addItem(s.itemId, s.count, session.a);
+      }
+      // Audit log
+      this.auditEconomy(session.a, 'trade', copperA_before, metaA.copper,
+        `Trade with ${session.b}: sent ${session.offerA.copper}c + items, received ${session.offerB.copper}c + items`);
+      this.auditEconomy(session.b, 'trade', copperB_before, metaB.copper,
+        `Trade with ${session.a}: sent ${session.offerB.copper}c + items, received ${session.offerA.copper}c + items`);
+      for (const tPid of [session.a, session.b]) {
+        this.emit({ type: 'log', text: 'Trade complete.', color: '#8df', pid: tPid });
+        this.emit({ type: 'tradeDone', pid: tPid });
+      }
+      this.closeTrade(session);
+    } finally {
+      this.releaseEconomyLock(session.a);
+      this.releaseEconomyLock(session.b);
     }
-    for (const s of session.offerB.items) {
-      this.removeItem(s.itemId, s.count, session.b);
-      this.addItem(s.itemId, s.count, session.a);
-    }
-    for (const tPid of [session.a, session.b]) {
-      this.emit({ type: 'log', text: 'Trade complete.', color: '#8df', pid: tPid });
-      this.emit({ type: 'tradeDone', pid: tPid });
-    }
-    this.closeTrade(session);
   }
 
   tradeCancel(pid?: number): void {
@@ -6474,29 +6633,42 @@ export class Sim {
     if (!r) return;
     const { meta, e: p } = r;
     if (p.dead) return;
-    if (!this.nearMerchant(p)) { this.error(meta.entityId, 'You are too far from the Merchant.'); return; }
-    const idx = this.marketListings.findIndex((l) => l.id === listingId);
-    if (idx < 0) { this.error(meta.entityId, 'That listing is no longer available.'); return; }
-    const listing = this.marketListings[idx];
-    const def = ITEMS[listing.itemId];
-    if (!def) { this.marketListings.splice(idx, 1); return; }
-    if (!listing.house && listing.sellerKey === meta.name) {
-      this.error(meta.entityId, 'That is your own listing — cancel it to reclaim it.');
+    if (!this.checkActionRate(r.meta.entityId, 'market_buy', 0.3)) return; // max ~3/s
+    if (!this.tryEconomyLock(r.meta.entityId)) {
+      this.error(r.meta.entityId, 'Please wait, another transaction is processing.');
       return;
     }
-    if (meta.copper < listing.price) { this.error(meta.entityId, 'You cannot afford that.'); return; }
-    meta.copper -= listing.price;
-    this.addItem(listing.itemId, listing.count, meta.entityId);
-    if (!listing.house) {
-      const proceeds = Math.max(0, Math.floor(listing.price * (1 - MARKET_CUT)));
-      this.collectionFor(listing.sellerKey).copper += proceeds;
-      this.marketListings.splice(idx, 1);
-      const sellerMeta = this.metaByName(listing.sellerKey);
-      if (sellerMeta) {
-        this.emit({ type: 'loot', text: `${meta.name} bought your ${def.name} for ${formatMoney(listing.price)} — collect ${formatMoney(proceeds)} from the Merchant.`, pid: sellerMeta.entityId });
+    try {
+      if (!this.nearMerchant(p)) { this.error(meta.entityId, 'You are too far from the Merchant.'); return; }
+      const idx = this.marketListings.findIndex((l) => l.id === listingId);
+      if (idx < 0) { this.error(meta.entityId, 'That listing is no longer available.'); return; }
+      const listing = this.marketListings[idx];
+      const def = ITEMS[listing.itemId];
+      if (!def) { this.marketListings.splice(idx, 1); return; }
+      if (!listing.house && listing.sellerKey === meta.name) {
+        this.error(meta.entityId, 'That is your own listing — cancel it to reclaim it.');
+        return;
       }
+      if (meta.copper < listing.price) { this.error(meta.entityId, 'You cannot afford that.'); return; }
+      const copperBefore = meta.copper;
+      meta.copper -= listing.price;
+      this.addItem(listing.itemId, listing.count, meta.entityId);
+      if (!listing.house) {
+        const proceeds = Math.max(0, Math.floor(listing.price * (1 - MARKET_CUT)));
+        this.collectionFor(listing.sellerKey).copper += proceeds;
+        this.marketListings.splice(idx, 1);
+        const sellerMeta = this.metaByName(listing.sellerKey);
+        if (sellerMeta) {
+          this.emit({ type: 'loot', text: `${meta.name} bought your ${def.name} for ${formatMoney(listing.price)} — collect ${formatMoney(proceeds)} from the Merchant.`, pid: sellerMeta.entityId });
+        }
+      }
+      // Audit log
+      this.auditEconomy(meta.entityId, 'market_buy', copperBefore, meta.copper,
+        `Bought ${def.name} x${listing.count} for ${listing.price}c from listing #${listingId}`, listing.itemId, listing.count);
+      this.emit({ type: 'loot', text: `Bought ${def.name}${listing.count > 1 ? ' x' + listing.count : ''} for ${formatMoney(listing.price)}.`, pid: meta.entityId });
+    } finally {
+      this.releaseEconomyLock(r.meta.entityId);
     }
-    this.emit({ type: 'loot', text: `Bought ${def.name}${listing.count > 1 ? ' x' + listing.count : ''} for ${formatMoney(listing.price)}.`, pid: meta.entityId });
   }
 
   // Reclaim your own listing; the escrowed goods go straight back to your bags.
@@ -6504,15 +6676,26 @@ export class Sim {
     const r = this.resolve(pid);
     if (!r) return;
     const { meta, e: p } = r;
-    if (!this.nearMerchant(p)) { this.error(meta.entityId, 'You are too far from the Merchant.'); return; }
-    const idx = this.marketListings.findIndex((l) => l.id === listingId);
-    if (idx < 0) return;
-    const listing = this.marketListings[idx];
-    if (listing.house || listing.sellerKey !== meta.name) { this.error(meta.entityId, 'That is not your listing.'); return; }
-    this.marketListings.splice(idx, 1);
-    this.addItem(listing.itemId, listing.count, meta.entityId);
-    const def = ITEMS[listing.itemId];
-    this.emit({ type: 'loot', text: `Reclaimed ${def?.name ?? listing.itemId}${listing.count > 1 ? ' x' + listing.count : ''} from the market.`, pid: meta.entityId });
+    if (!this.checkActionRate(r.meta.entityId, 'market_cancel', 0.3)) return;
+    if (!this.tryEconomyLock(r.meta.entityId)) {
+      this.error(r.meta.entityId, 'Please wait, another transaction is processing.');
+      return;
+    }
+    try {
+      if (!this.nearMerchant(p)) { this.error(meta.entityId, 'You are too far from the Merchant.'); return; }
+      const idx = this.marketListings.findIndex((l) => l.id === listingId);
+      if (idx < 0) return;
+      const listing = this.marketListings[idx];
+      if (listing.house || listing.sellerKey !== meta.name) { this.error(meta.entityId, 'That is not your listing.'); return; }
+      this.marketListings.splice(idx, 1);
+      this.addItem(listing.itemId, listing.count, meta.entityId);
+      const def = ITEMS[listing.itemId];
+      this.auditEconomy(meta.entityId, 'market_cancel', meta.copper, meta.copper,
+        `Cancelled listing #${listingId}: ${def?.name ?? listing.itemId} x${listing.count}`, listing.itemId, listing.count);
+      this.emit({ type: 'loot', text: `Reclaimed ${def?.name ?? listing.itemId}${listing.count > 1 ? ' x' + listing.count : ''} from the market.`, pid: meta.entityId });
+    } finally {
+      this.releaseEconomyLock(r.meta.entityId);
+    }
   }
 
   // Take everything waiting for you at the Merchant: sale gold and any items
@@ -6521,15 +6704,27 @@ export class Sim {
     const r = this.resolve(pid);
     if (!r) return;
     const { meta, e: p } = r;
-    if (!this.nearMerchant(p)) { this.error(meta.entityId, 'You are too far from the Merchant.'); return; }
-    const col = this.marketCollections.get(meta.name);
-    if (!col || (col.copper <= 0 && col.items.length === 0)) { this.error(meta.entityId, 'You have nothing to collect.'); return; }
-    if (col.copper > 0) {
-      meta.copper += col.copper;
-      this.emit({ type: 'loot', text: `You collect ${formatMoney(col.copper)} from the Merchant.`, pid: meta.entityId });
+    if (!this.checkActionRate(r.meta.entityId, 'market_collect', 0.5)) return;
+    if (!this.tryEconomyLock(r.meta.entityId)) {
+      this.error(r.meta.entityId, 'Please wait, another transaction is processing.');
+      return;
     }
-    for (const s of col.items) this.addItem(s.itemId, s.count, meta.entityId);
-    this.marketCollections.delete(meta.name);
+    try {
+      if (!this.nearMerchant(p)) { this.error(meta.entityId, 'You are too far from the Merchant.'); return; }
+      const col = this.marketCollections.get(meta.name);
+      if (!col || (col.copper <= 0 && col.items.length === 0)) { this.error(meta.entityId, 'You have nothing to collect.'); return; }
+      const copperBefore = meta.copper;
+      if (col.copper > 0) {
+        meta.copper += col.copper;
+        this.auditEconomy(meta.entityId, 'market_collect', copperBefore, meta.copper,
+          `Collected ${col.copper}c from market sales`);
+        this.emit({ type: 'loot', text: `You collect ${formatMoney(col.copper)} from the Merchant.`, pid: meta.entityId });
+      }
+      for (const s of col.items) this.addItem(s.itemId, s.count, meta.entityId);
+      this.marketCollections.delete(meta.name);
+    } finally {
+      this.releaseEconomyLock(r.meta.entityId);
+    }
   }
 
   // Once a second: return expired player listings to their seller's collection.
@@ -6671,6 +6866,18 @@ export class Sim {
       inst = this.instances.find((i) => i.dungeonId === dungeonId && i.partyKey === null);
       if (!inst) { this.error(r.meta.entityId, `All instances of ${dungeon.name} are busy. Try again soon.`); return; }
       this.claimInstance(inst, key);
+    }
+    // Security: if the instance is claimed by a different party key and the player
+    // is not in that party, reject entry. Prevents exploiting another group's instance.
+    if (inst.partyKey !== key) {
+      // The player might have changed parties since claiming; check both keys
+      const playerParty = this.partyOf(r.meta.entityId);
+      const instancePid = inst.partyKey?.startsWith('solo:') ? parseInt(inst.partyKey.slice(5), 10) : NaN;
+      const isInstancePartyPlayer = !isNaN(instancePid) ? instancePid === r.meta.entityId : false;
+      if (!isInstancePartyPlayer && (!playerParty || inst.partyKey !== `party:${playerParty.id}`)) {
+        this.error(r.meta.entityId, 'That instance belongs to another group.');
+        return;
+      }
     }
     const party = this.partyOf(r.meta.entityId);
     if (!party || party.members.length < dungeon.suggestedPlayers) {
