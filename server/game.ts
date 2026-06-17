@@ -55,6 +55,32 @@ const STALE_INPUT_SECONDS = 0.75;
 // Exponential moving average weight for the per-tick duration stat.
 const TICK_EMA_ALPHA = 0.05;
 
+// ── Command Rate Limiting ───────────────────────────────────────────
+// Maximum game commands (non-input messages) per second per account.
+// Each 'cmd' message counts toward this limit.
+const MAX_CMD_RATE = 30;
+const CMD_WINDOW_MS = 1000;
+
+// Per-command-type minimum interval (ms) to enforce basic rate shaping.
+const CMD_MIN_INTERVAL_MS: Record<string, number> = {
+  market_list: 500, market_buy: 350, market_cancel: 350, market_collect: 500,
+  trade_offer: 300, trade_confirm: 500, trade_cancel: 300, trade_req: 500,
+  friend_add: 1000, friend_remove: 1000,
+  guild_create: 3000, guild_invite: 1000, guild_kick: 1000, guild_disband: 10000,
+  arena_queue: 3000,
+  pet_abandon: 2000, pet_revive: 3000,
+  dev_level: 500, dev_teleport: 500, dev_give: 500,
+  // All others default to 100ms (10/s) implicitly
+};
+
+// Per-account command rate state.
+interface CmdTracker {
+  timestamps: number[];
+  lastCmdTime: Map<string, number>; // cmd -> last allowed time (ms)
+}
+
+const cmdTrackers = new Map<number, CmdTracker>();
+
 export interface ClientSession {
   ws: WebSocket;
   accountId: number;
@@ -284,6 +310,31 @@ function chatChannelHint(session: ClientSession, text: string): string {
   if (/^\/(?:general|world)\s/i.test(text)) return 'general';
   if (/^\/(?:s|say)\s/i.test(text)) return 'say';
   return session.rememberedChat.channel;
+}
+
+// ── Command Rate Limiting ───────────────────────────────────────────
+// Returns true if the command is allowed, false if rate-limited.
+function checkCmdRate(accountId: number, cmd: string): boolean {
+  const now = Date.now();
+  let tracker = cmdTrackers.get(accountId);
+  if (!tracker) {
+    tracker = { timestamps: [], lastCmdTime: new Map() };
+    cmdTrackers.set(accountId, tracker);
+  }
+
+  // Per-command interval check
+  const minInterval = CMD_MIN_INTERVAL_MS[cmd] ?? 100;
+  const lastTime = tracker.lastCmdTime.get(cmd) ?? 0;
+  if (now - lastTime < minInterval) return false;
+  tracker.lastCmdTime.set(cmd, now);
+
+  // Global per-account rate check (rolling window)
+  const cutoff = now - CMD_WINDOW_MS;
+  tracker.timestamps = tracker.timestamps.filter((t) => t > cutoff);
+  if (tracker.timestamps.length >= MAX_CMD_RATE) return false;
+  tracker.timestamps.push(now);
+
+  return true;
 }
 
 export class GameServer {
@@ -741,12 +792,21 @@ export class GameServer {
   // -------------------------------------------------------------------------
 
   handleMessage(session: ClientSession, raw: string): void {
+    // Size limit: reject oversized messages (max 8KB)
+    if (raw.length > 8192) {
+      console.warn(`oversized message (${raw.length}B) from ${session.name}, dropping`);
+      return;
+    }
     let msg: any;
     try {
       msg = JSON.parse(raw);
     } catch {
       return;
     }
+    // Reject primitive JSON values (must be an object)
+    if (typeof msg !== 'object' || msg === null || Array.isArray(msg)) return;
+    // Reject messages with unknown top-level type
+    if (msg.t !== 'input' && msg.t !== 'cmd') return;
     // a malformed payload must never take down the server for everyone
     try {
       this.dispatchMessage(session, msg);
@@ -763,6 +823,11 @@ export class GameServer {
     const sim = this.sim;
     const pid = session.pid;
     if (msg.t === 'input') {
+      // Movement frame rate limiting: max ~25/s (40ms). Any faster is noise.
+      const now = Date.now();
+      const lastInput = (session as any)._lastInputTime ?? 0;
+      if (now - lastInput < 30) return;
+      (session as any)._lastInputTime = now;
       const meta = sim.meta(pid);
       const e = sim.entities.get(pid);
       if (!meta || !e) return;
@@ -778,6 +843,8 @@ export class GameServer {
       return;
     }
     if (msg.t !== 'cmd') return;
+    // Rate limit ALL commands (excluding input frames)
+    if (!checkCmdRate(session.accountId, msg.cmd)) return;
     switch (msg.cmd) {
       case 'castSlot': sim.castAbilityBySlot(msg.slot | 0, pid); break;
       case 'cast': if (typeof msg.ability === 'string') sim.castAbility(msg.ability, pid); break;
